@@ -99,8 +99,14 @@ fn read_line(buf: &mut [u8]) -> usize {
     loop {
         let mut one = [0u8; 1];
         match read(STDIN, &mut one) {
+            // R13： WouldBlock（-EAGAIN）= 无键可读（键盘空闲或被唤醒后尚未
+            // pop 到字符），必须**重试**而非当成行结束。此前任何 Err 都 return：
+            // stdin 空闲时 sys_read 的探测路径立即返回 WouldBlock，三次尝试
+            // 在零输入下即被空行耗尽（实测 boot15：未按键即三连 "authentication
+            // failed"）。Ok(0) 仍是诚实 EOF（stdin 不可写端关闭），照旧返回。
+            Err(Error::WouldBlock) => continue,
             Ok(0) | Err(_) => {
-                // 读到 EOF / 出错：返回已收集内容，不假装读到了完整行。
+                // 读到 EOF / 其他错误：返回已收集内容，不假装读到了完整行。
                 return n;
             }
             Ok(_) => {}
@@ -258,13 +264,35 @@ fn login_main() -> i32 {
 
         // ---- 切换到 shell ----
         // exec 失败时**不回落**到特权上下文：身份已降，此处失败只是"登不进去"。
-        match libsys::exec_path(SHELL_PATH, &[]) {
-            Ok(_pid) => {}
+        // 【R13 会话保活】exec_path = SYS_TASK_SPAWN：shell 是 login 的**子进程**。
+        // login 必须等 shell 退出后**再**退出——若 login 先退（exit 0），init 的
+        // supervisor 判"会话结束"立刻重生 login，而 shell 仍持有键盘等待者，
+        // 两个 stdin 读者并发瓜分击键（实测 boot16：`cat /config/shadow.json`
+        // 被 pid 7/8 交错读取，字符各得一半），并伴随虚假 NUL 回显。
+        let shell_pid = match libsys::exec_path(SHELL_PATH, &[]) {
+            Ok(pid) => pid,
             Err(e) => {
                 puts(b"login: cannot start shell (");
                 print_errno(e);
                 puts(b")\n");
                 return 5;
+            }
+        };
+        loop {
+            match libsys::waitpid_any() {
+                Ok(wr) if wr.pid == shell_pid => {
+                    // shell 已退出：会话随之结束，init 重生 login（下一位用户）。
+                    break;
+                }
+                Ok(_) => continue, // 收到别的子进程（当前无），继续等 shell
+                Err(libsys::Error::WouldBlock) => {
+                    // shell 仍在运行：让出 CPU 等待（与 init 等待循环同款纪律）。
+                    let _ = libsys::sleep(100_000_000);
+                }
+                Err(_) => {
+                    // waitpid 不可用（理论不可达）：如实结束会话。
+                    break;
+                }
             }
         }
         return 0;
