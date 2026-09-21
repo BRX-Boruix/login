@@ -62,7 +62,91 @@
 #![no_main]
 extern crate alloc;
 
-use libsys::{read, write, Error};
+use libsys::{open, read, write, Error, OpenFlags, Permissions};
+
+/// 把无符号数以十进制追加到 String（login 不依赖 core::fmt 的格式化机器）。
+fn push_dec(body: &mut alloc::string::String, mut v: u64) {
+    if v == 0 {
+        body.push('0');
+        return;
+    }
+    let mut tmp = [0u8; 20];
+    let mut i = tmp.len();
+    while v > 0 && i > 0 {
+        i -= 1;
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    body.push_str(core::str::from_utf8(&tmp[i..]).unwrap_or(""));
+}
+
+/// 【R13 后续：投影自愈】认证成功后（**降权前**的 uid0+CAP_SYSTEM 窗口内），把
+/// shadow.json **全表**重投影为 /config/users.json。
+///
+/// 设计定位（ADR-041 §1.2.6 延伸）：
+/// - shadow.json 是**唯一权威**（uid/gid/name + 口令）；users.json 此前是内核
+///   种子播种的**第二份静态副本**——两处种子各自维护导致投影失步（实测：root
+///   在 shadow 有条目、users.json 没有，登录后 shell 提示符只显示 "uid0"）。
+/// - 自愈后 users.json 变为"shadow 的展示投影"，由认证路径维护：任何可认证
+///   账户**第一次登录**后就必然出现在投影里，不存在"忘记同步"。
+/// - **为何全表重投影**（而非只补当前用户）：投影 = 权威的完整镜像，逐条 upsert
+///   会留下"改过 shadow 但该账户从未登录"的半失步态；全表写入让两个文件在
+///   任何一次登录后**完全一致**（删除的账户也随之从投影消失）。
+/// - **为何在降权前**：此刻仍是 uid0（shadow 属主）+ CAP_SYSTEM，既读得到
+///   权威表、也写得了投影文件（0600→0644 属主写）；降权后两者都不可写。
+/// - **绝不投影 salt/hash**：只写 name/uid/gid 三字段——users.json 保持 0644
+///   全员可读，哈希永不出 shadow（ADR-041 §1.2.0 的分离前提原样保持）。
+/// - **失败语义**：投影失败（写不进/序列化不可能失败）只**告警不阻断**——登录
+///   的职责是认证，投影是尽力而为的衍生品；但告警如实打印，不静默。
+fn regenerate_users_projection(shadow: &[libc::shadow::ShadowEntry]) {
+    // 渲染：schema 与原种子/userd 解析器完全一致（S13：同一格式一处定语义）。
+    // 账户名是解析器从 JSON 里读出来的字符串（不含引号/控制字符的普通名字），
+    // 此处如原样回填 JSON 字符串字面量；数字用小助手转十进制（login 无 fmt 依赖）。
+    let mut body = alloc::string::String::from("{\"users\":[");
+    for (i, e) in shadow.iter().enumerate() {
+        if i > 0 {
+            body.push(',');
+        }
+        body.push_str("{\"name\":\"");
+        body.push_str(&e.name);
+        body.push_str("\",\"uid\":");
+        push_dec(&mut body, e.uid as u64);
+        body.push_str(",\"gid\":");
+        push_dec(&mut body, e.gid as u64);
+        body.push_str("}");
+    }
+    body.push_str("]}\n");
+
+    // 写投影：CREATE_OR_TRUNCATE 保证整文件替换（不留旧条目尾巴）。
+    // 权限传 all() 只影响**新建**时的初始模式；文件已存在（常态）则模式不变。
+    match open("/config/users.json", OpenFlags::CREATE_OR_TRUNCATE, Permissions::all()) {
+        Ok(fd) => {
+            let bytes = body.as_bytes();
+            let mut off = 0usize;
+            let mut ok = true;
+            while off < bytes.len() {
+                match write(fd, &bytes[off..]) {
+                    Ok(0) => { ok = false; break; }
+                    Ok(n) => off += n,
+                    Err(_) => { ok = false; break; }
+                }
+            }
+            let _ = libsys::close(fd);
+            if ok {
+                puts(b"login: users.json projection updated (");
+                let mut cnt = alloc::string::String::new();
+                push_dec(&mut cnt, shadow.len() as u64);
+                puts(cnt.as_bytes());
+                puts(b" accounts)\n");
+            } else {
+                puts(b"login: WARNING users.json projection write failed\n");
+            }
+        }
+        Err(_) => {
+            puts(b"login: WARNING users.json projection open failed\n");
+        }
+    }
+}
 
 /// 标准输入 fd。
 const STDIN: u64 = 0;
@@ -219,6 +303,10 @@ fn login_main() -> i32 {
             None => return 2, // 不可达：上面刚找到；防御性返回。
         };
         let (uid, gid) = (entry.uid, entry.gid);
+
+        // ---- 投影自愈：shadow 全表 → users.json（仍持 uid0+CAP_SYSTEM）----
+        // 必须在 groups_set/identity_set **之前**：降权后既读不到 shadow 也写不了投影。
+        regenerate_users_projection(&shadow);
 
         // ---- 降权：先设补充组，再设身份，顺序不可颠倒 ----
         // 先设组是因为身份切换后可能已失去 CAP_SYSTEM，届时 groups_set 会被拒绝。
