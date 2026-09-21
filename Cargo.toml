@@ -1,0 +1,16 @@
+[package]
+name = "login"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+libsys = { path = "../libsys" }
+libc = { path = "../libc" }
+
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
