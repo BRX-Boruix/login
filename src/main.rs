@@ -52,14 +52,19 @@
 //!
 //! ## 诚实边界（S39）
 //!
-//! - **口令回显**：不做关闭回显——本内核终端层无 termios，且**不假装**做了。
-//!   已实现的是**退格可erase**（见 `read_line`），这只影响可用性，不影响认证正确性。
-//!   此限制已在 ADR-041 与本注释中显式声明，不得据"看起来像图形登录"推断回显已关。
-//!   > **2026-10-04 追记（ADR-042）**："无 termios" 已从事实状态升格为**决策**——
+//! - **口令回显**：**已关闭**（2026-10-04，L-3 落地）。读口令走
+//!   [`libline::read_line_plain`] 并传 `suppress_echo: true`，任何输入都不上屏。
+//!   该能力由用户态库 `libline` 提供——**内核一行未改**，也不引入 termios。
+//!   > **本条曾长期登记为未关闭**（ADR-041 §4.2 / `docs/TODO/multi-user.md`）。
 //!   > [ADR-042 输入侧不背历史债](../../docs/adr/042-input-side-no-legacy-canonical-mode.md)
-//!   > 明确拒绝 canonical 模式与 termios，行规程（含行编辑与回显抑制）归用户态库。
-//!   > **本程序的行为不因该 ADR 改变**：在行编辑库（T-LIBLINE）落地前，回显照旧；
-//!   > 落地后 `login` 应改用库提供的回显抑制，而非在内核寻求 termios。
+//!   > 明确拒绝 canonical 模式与 termios，行规程（含行编辑与回显抑制）归用户态库；
+//!   > [ADR-046 决策 3](../../docs/adr/046-line-editing-user-space-library.md)
+//!   > 指定 `login` 是回显抑制的落点。两者现已兑现。
+//!   > **验证方式**：真实 QEMU 中经 PS/2 键盘键入口令，串口日志中
+//!   > **不出现**口令明文，而用户名逐字回显（见 `sdk/l3_interactive.py`）。
+//! - **只取回显抑制子集**：`login` **不**背历史与 Tab 补全（ADR-046 §4 条 3）。
+//!   这不是口头约定：`read_line_plain` 把 `EditorCaps` 裁到 `plain()`，
+//!   历史/补全在该路径上**编译期可见地不可达**，且 `completions` 永不被调用。
 //! - **无失败锁定/审计**：不实现 PAM 式 `pam_faillock`（ADR-041 §1.2.2 已列明为差异项）。
 //! - **无超时**：输入不设时限。
 
@@ -177,58 +182,164 @@ fn nl() {
     puts(b"\n");
 }
 
-/// 读取一行（以 \n 或 \r 结束），支持退格。
+/// `login` 的 `EditorHost`：只需「把字节写到 stdout」与「重绘当前行」。
 ///
-/// **为何自己实现**：本内核 shell 侧**没有** cooked-mode / 行编辑器helper——
-/// 终端读取是逐字节裸循环。任何登录程序都必须自带"读一行 + 处理退格"逻辑。
+/// **为何没有真正的补全实现**：`login` 走 [`libline::read_line_plain`]，该路径把
+/// `EditorCaps` 裁到 `plain()`（历史/补全均不可达），故 `completions`
+/// **永远不会被调用**。这里如实返回空，不伪造候选。
 ///
-/// 返回：去掉行尾符后的字节数（0 表示空行）。**不 panic**——缓冲区满即截断返回。
-fn read_line(buf: &mut [u8]) -> usize {
-    let mut n = 0usize;
-    loop {
-        let mut one = [0u8; 1];
-        match read(STDIN, &mut one) {
-            // R13： WouldBlock（-EAGAIN）= 无键可读（键盘空闲或被唤醒后尚未
-            // pop 到字符），必须**重试**而非当成行结束。此前任何 Err 都 return：
-            // stdin 空闲时 sys_read 的探测路径立即返回 WouldBlock，三次尝试
-            // 在零输入下即被空行耗尽（实测 boot15：未按键即三连 "authentication
-            // failed"）。Ok(0) 仍是诚实 EOF（stdin 不可写端关闭），照旧返回。
-            Err(Error::WouldBlock) => continue,
-            Ok(0) | Err(_) => {
-                // 读到 EOF / 其他错误：返回已收集内容，不假装读到了完整行。
-                return n;
-            }
-            Ok(_) => {}
+/// **重绘为何不打提示符**：`username: ` / `password: ` 由调用方在读之前打印一次。
+/// 若在重绘里重复打印，口令输入时会把提示符刷屏；且口令本就不该重绘。
+struct LoginHost;
+
+impl libline::EditorHost for LoginHost {
+    fn write(&mut self, bytes: &[u8]) {
+        puts(bytes);
+    }
+
+    /// 回到行首 → 清行 → 重打缓冲区 → 光标左移回原位。
+    ///
+    /// 字节序列与 `shell` 的重绘保持一致（`\r` + `\x1b[K` + 内容 + `\x1b[<n>D`），
+    /// 这样两个程序的终端行为相同，用户不会觉得登录界面与 shell 不一样。
+    fn redraw(&mut self, buffer: &[u8], cursor: usize) {
+        puts(b"\r\x1b[K");
+        puts(buffer);
+        let back = buffer.len().saturating_sub(cursor);
+        if back > 0 {
+            let mut b = [0u8; 24];
+            puts(b"\x1b[");
+            puts(dec_bytes(back as u64, &mut b));
+            puts(b"D");
         }
-        match one[0] {
-            b'\n' | b'\r' => {
-                nl();
-                return n;
-            }
-            // 退格（BS 0x08 与 DEL 0x7f 都接受）：仅在非空时回退并erase屏幕。
-            0x08 | 0x7f => {
-                if n > 0 {
-                    n -= 1;
-                    // "\x08 \x08" 是终端 erase 惯用法：退格、空格覆盖、再退格。
-                    puts(b"\x08 \x08");
+    }
+
+    /// 不给候选：`login` 走的路径不会调用本方法（见类型文档）。
+    fn completions(&mut self, _word: &[u8], _is_command: bool) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+        alloc::vec::Vec::new()
+    }
+}
+
+/// 从 fd 0 取字节的输入源。
+///
+/// **为何要这一层**：`libline::ByteSource` 只解码**已被推入**的字节；「字节从哪来」
+/// 是调用方的事（键盘 vs 事件总线，ADR-046 §4 条 5）。本类型就是 login 的答案：
+/// 从 fd 0 读。`libline` 侧因此不需要知道终端的存在。
+#[derive(Default)]
+struct StdinSource {
+    inner: libline::ByteSource,
+}
+
+impl libline::InputSource for StdinSource {
+    fn next_item(&mut self) -> libline::InputItem {
+        self.inner.next_item()
+    }
+
+    /// 从 fd 0 取一个字节，**在没有数据时原地重试**（不返回 `false` 去让出 CPU）。
+    ///
+    /// # 为何必须重试而不是让出（L-3 实测踩到的真实缺陷）
+    ///
+    /// 本内核的键盘阻塞是**单等待者**语义：`read` 空读时经 `block_for_kbd` 以 CAS
+    /// 登记 `KBD_WAITER` 并挂起自己；键盘中断经 `wake_kbd` 把**登记过的那个 pid**
+    /// 放回就绪队列（`kernel/crates/task/src/scheduler.rs:1712`、`:1836`）。
+    ///
+    /// 而 `libsys::yield_now()` 走的是 `SYS_TASK_WAIT(0,0)`——**纯让出，不登记
+    /// `KBD_WAITER`**。于是若本方法在无键可读时返回 `false`，`libline` 就会
+    /// `yield_now()` 空转：此时**没人登记等待**，`wake_kbd` 无处可唤醒，
+    /// 击键只能躺在键盘队列里，直到下一次 `read` 恰好被调用才可能被取走。
+    ///
+    /// **实测症状**（真实 QEMU + PS/2 真实按键）：读用户名正常（每次回显都伴随
+    /// write 系统调用，节奏被带起来了），但读口令时——**回显被抑制、几乎不发
+    /// 系统调用**——键入了 8 个口令字符后，**回车永远不到**，登录永久挂住。
+    /// 逐单元探针证据：`[IT] C=a..w` 全部到达，`[IT] SUBMIT` 永不出现；
+    /// 改成原地重试后同一探针立刻拿到 `[IT] SUBMIT` 并登录成功。
+    ///
+    /// **与原实现的等价性**：修改前的 `login` 朴素 `read_line` 正是原地
+    /// `continue`（见 git 历史），所以本写法不是新发明，而是**保住既有正确
+    /// 行为**——这也解释了为何此前从未暴露：老实现压根不走 yield 路径。
+    ///
+    /// **为何不让 `libline` 各调用方自己决定是否 yield**：那是接口层面的设计
+    /// 问题（poll 语义 vs park 语义），已如实登记，不在 L-3 内擅自扩大改动。
+    fn refill(&mut self) -> bool {
+        let mut one = [0u8; 1];
+        loop {
+            match read(STDIN, &mut one) {
+                Ok(1) => {
+                    self.inner.push_bytes(&one);
+                    return true;
                 }
-            }
-            c => {
-                if n < buf.len() {
-                    buf[n] = c;
-                    n += 1;
-                    // 回显读入字符（见模块文档"诚实边界"：未关闭回显）。
-                    let _ = write(STDOUT, &[c]);
-                }
-                // 缓冲满：静默忽略后续字符（不 panic、不丢已读内容）。
+                // 键盘空闲：**继续重试**（保持在内核里登记为键盘等待者）。
+                Err(Error::WouldBlock) => continue,
+                // 真错误 / 诚实 EOF：如实报「没有新增字节」。
+                _ => return false,
             }
         }
     }
 }
 
-/// 从 stdin 读一行并去除首尾空白，返回长度。
-fn read_trimmed(buf: &mut [u8]) -> usize {
-    let n = read_line(buf);
+/// 把无符号数以十进制写进 `buf`，返回有效切片（供重绘的光标左移使用）。
+fn dec_bytes(mut v: u64, buf: &mut [u8]) -> &[u8] {
+    if v == 0 {
+        buf[0] = b'0';
+        return &buf[..1];
+    }
+    let mut i = buf.len();
+    while v > 0 && i > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    let n = buf.len() - i;
+    buf.copy_within(i.., 0);
+    &buf[..n]
+}
+
+/// 从 stdin 读一行（去首尾空白），返回长度。
+///
+/// `suppress_echo` 为 `true` 时（读口令），任何输入都不上屏。
+///
+/// **2026-10-04（L-3）**：原本本文件自带一份朴素的「逐字节读 + 退格」循环
+/// （S28 登记的双份实现之一）。现改走 [`libline::read_line_plain`]——该工具函数把
+/// `EditorCaps` 裁到 `plain()`，历史与补全在本路径上**不可达**，
+/// 故 `login` 不会背上它不该有的能力（ADR-046 §4 条 3）。
+///
+/// 返回：去掉首尾空白后的字节数。0 表示空行。
+/// **不 panic**——超过 `buf.len()` 即截断（缓冲区由 `Editor` 动态承载，
+/// 再按需拷入调用方的固定缓冲）。
+fn read_trimmed(buf: &mut [u8], suppress_echo: bool) -> usize {
+    let mut editor = libline::Editor::new();
+    let mut src = StdinSource::default();
+    let mut host = LoginHost;
+
+    // `read_line` 只在 提交/中断/EOF 时返回，**不会**返回 `Continue`；
+    // 故这里不需要外层循环。回车由下方 `nl()` 统一补一个换行。
+    let line = match libline::read_line_plain(
+        &mut editor,
+        &mut src,
+        &mut host,
+        |_h| {},
+        libline::PlainLineOptions { suppress_echo },
+    ) {
+        libline::EditAction::Submitted(l) => {
+            nl();
+            l
+        }
+        // EOF：如实把已收集内容交回，不假装读到了完整行。
+        libline::EditAction::Eof(l) => {
+            nl();
+            l
+        }
+        // 中断：本行作废。
+        libline::EditAction::Interrupted => {
+            nl();
+            alloc::vec::Vec::new()
+        }
+        libline::EditAction::Continue => alloc::vec::Vec::new(),
+    };
+
+    // 固定缓冲区截断：保持原有契约（满即截断，不 panic）。
+    let n = core::cmp::min(line.len(), buf.len());
+    buf[..n].copy_from_slice(&line[..n]);
+
     let mut s = 0usize;
     let mut e = n;
     while s < e && (buf[s] == b' ' || buf[s] == b'\t') {
@@ -264,7 +375,7 @@ fn login_main() -> i32 {
     let mut attempt = 0usize;
     while attempt < MAX_ATTEMPTS {
         puts(b"username: ");
-        let nlen = read_trimmed(&mut name_buf);
+        let nlen = read_trimmed(&mut name_buf, false);
         if nlen == 0 {
             // 空用户名：计入一次尝试（避免空回车无限刷屏）。
             attempt += 1;
@@ -281,7 +392,7 @@ fn login_main() -> i32 {
         };
 
         puts(b"password: ");
-        let plen = read_trimmed(&mut pw_buf);
+        let plen = read_trimmed(&mut pw_buf, true);
 
         // 校验：用户不存在与口令错误**给出同一条消息**（避免用户名枚举，§1.5）。
         let ok = match shadow.iter().find(|e| e.name == name) {
