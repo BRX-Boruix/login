@@ -356,6 +356,56 @@ fn read_trimmed(buf: &mut [u8], suppress_echo: bool) -> usize {
 
 /// 主流程。**任何失败路径都以非零码退出，绝不降权后返回**。
 fn login_main(instance: usize) -> i32 {
+    // ---- 终端绑定 + 焦点认领（ADR-048 T5-c，owner 裁决 B：**认证前**）----
+    // Unix getty 同构：getty/login 打开 tty 即独占键盘，认证只是决定该绑定
+    // 最终成为会话。实例 0 的绑定是**零变化**（fd 0 本就是 StdinNode 单例→
+    // 焦点环=环 0；dup2 后 fd 0 指向 /devices/console=同环，S13 同一真值）。
+    // 实例 1+：fd 0 重定向到实例环（**消费侧绑定**——shell 读自己的环，
+    // 绝不读焦点环偷别的会话键盘，S20）；focus_set 让生产侧（consoled[N]
+    // 的写过滤）放行字节进环 N。二者都要求 CAP_SYSTEM——此刻 login 仍是
+    // init 给予的特权身份（合法窗口），认证失败即整体退出由 init 重生。
+    //
+    // 失败模式（S20）：绑定/认领任一失败 = 这个 getty 永远收不到键盘
+    //（假活会话）——如实退出，init 重生。绝不静默继续。
+    if instance != 0 {
+        // 消费侧绑定：fd 0 → 实例节点（shell 经 exec 继承此 fd 表）。
+        // no_std format! 走 alloc——login 已链 alloc（shadow 解析用）。
+        let path: alloc::string::String = alloc::format!("/devices/consoles/{}", instance);
+        let tty = match libsys::open(
+            &path,
+            libsys::OpenFlags::READ_ONLY,
+            libsys::Permissions::read_write(),
+        ) {
+            Ok(fd) => fd,
+            Err(e) => {
+                puts(b"login: cannot bind console instance ");
+                let mut ib = [0u8; 8];
+                puts(dec_bytes(instance as u64, &mut ib));
+                puts(b": ");
+                print_errno(e);
+                puts(b"\n");
+                return 6;
+            }
+        };
+        if let Err(e) = libsys::dup2(tty, libsys::STDIN) {
+            puts(b"login: cannot redirect stdin to console instance: ");
+            print_errno(e);
+            puts(b"\n");
+            return 7;
+        }
+        let _ = libsys::close(tty); // dup2 后原描述符冗余，收掉。
+    }
+    // 生产侧认领：键盘字节从此进本实例环（认证前 = getty 独占键盘形态）。
+    if let Err(e) = libsys::event::focus_set(instance) {
+        puts(b"login: cannot claim console focus (instance ");
+        let mut ib = [0u8; 8];
+        puts(dec_bytes(instance as u64, &mut ib));
+        puts(b"): ");
+        print_errno(e);
+        puts(b"\n");
+        return 5;
+    }
+
     puts(b"BORUIX login\n");
 
     // 载入口令表。读不到就是配置/权限错误——如实报错，**不**退化为"无口令放行"。
@@ -423,25 +473,6 @@ fn login_main(instance: usize) -> i32 {
         // ---- 投影自愈：shadow 全表 → users.json（仍持 uid0+CAP_SYSTEM）----
         // 必须在 groups_set/identity_set **之前**：降权后既读不到 shadow 也写不了投影。
         regenerate_users_projection(&shadow);
-
-        // ---- 焦点认领（ADR-048 T3，owner 裁决 α：SYS_STREAM_FOCUS_SET）----
-        // 认证成功后、**降权前**——此刻仍持 CAP_SYSTEM，是本会话唯一合法的
-        // 焦点授予窗口（tcsetpgrp 同构：策略在用户态认证点，机制在内核门禁）。
-        // 实例 0（单终端既有形态）也走同一调用：焦点真值本就指向 0，重复
-        // 设置幂等，但**保留调用**让「login 认领焦点」成为单径语义（S15：
-        // 不存在「实例 0 靠默认值、实例 1+ 靠 syscall」的双径）。
-        // 失败 = 焦点没切过去 = 会话收不到键盘（假活会话）——如实退出，
-        // 由 init 重生 getty（S20：绝不静默继续）。
-        if let Err(e) = libsys::event::focus_set(instance) {
-            puts(b"login: cannot claim console focus (instance ");
-            // instance 十进制（usize→u64 同宽，u8 缓冲必够）。
-            let mut ib = [0u8; 8];
-            puts(dec_bytes(instance as u64, &mut ib));
-            puts(b"): ");
-            print_errno(e);
-            puts(b"\n");
-            return 5;
-        }
 
         // ---- 降权：先设补充组，再设身份，顺序不可颠倒 ----
         // 先设组是因为身份切换后可能已失去 CAP_SYSTEM，届时 groups_set 会被拒绝。
