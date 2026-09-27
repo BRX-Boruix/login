@@ -355,7 +355,7 @@ fn read_trimmed(buf: &mut [u8], suppress_echo: bool) -> usize {
 }
 
 /// 主流程。**任何失败路径都以非零码退出，绝不降权后返回**。
-fn login_main() -> i32 {
+fn login_main(instance: usize) -> i32 {
     puts(b"BORUIX login\n");
 
     // 载入口令表。读不到就是配置/权限错误——如实报错，**不**退化为"无口令放行"。
@@ -423,6 +423,25 @@ fn login_main() -> i32 {
         // ---- 投影自愈：shadow 全表 → users.json（仍持 uid0+CAP_SYSTEM）----
         // 必须在 groups_set/identity_set **之前**：降权后既读不到 shadow 也写不了投影。
         regenerate_users_projection(&shadow);
+
+        // ---- 焦点认领（ADR-048 T3，owner 裁决 α：SYS_STREAM_FOCUS_SET）----
+        // 认证成功后、**降权前**——此刻仍持 CAP_SYSTEM，是本会话唯一合法的
+        // 焦点授予窗口（tcsetpgrp 同构：策略在用户态认证点，机制在内核门禁）。
+        // 实例 0（单终端既有形态）也走同一调用：焦点真值本就指向 0，重复
+        // 设置幂等，但**保留调用**让「login 认领焦点」成为单径语义（S15：
+        // 不存在「实例 0 靠默认值、实例 1+ 靠 syscall」的双径）。
+        // 失败 = 焦点没切过去 = 会话收不到键盘（假活会话）——如实退出，
+        // 由 init 重生 getty（S20：绝不静默继续）。
+        if let Err(e) = libsys::event::focus_set(instance) {
+            puts(b"login: cannot claim console focus (instance ");
+            // instance 十进制（usize→u64 同宽，u8 缓冲必够）。
+            let mut ib = [0u8; 8];
+            puts(dec_bytes(instance as u64, &mut ib));
+            puts(b"): ");
+            print_errno(e);
+            puts(b"\n");
+            return 5;
+        }
 
         // ---- 降权：先设补充组，再设身份，顺序不可颠倒 ----
         // 先设组是因为身份切换后可能已失去 CAP_SYSTEM，届时 groups_set 会被拒绝。
@@ -536,7 +555,45 @@ fn errno_of(e: Error) -> i32 {
 ///
 /// 返回退出码；**不**自行调用 `exit`——由用户态运行时按返回值收尾，
 /// 避免与运行时重复退出（既有程序一致的做法）。
+/// 解析 argv[0] 为实例 id（十进制；无 argv = 0——init 既有 spawn 形态兼容）。
+/// 非法如实退出（错误的实例号 = 会话接错终端，比死更糟，S09/S17）。
+fn parse_instance(argc: isize, argv: *const *const u8) -> Option<usize> {
+    if argc <= 0 || argv.is_null() {
+        return Some(0);
+    }
+    // SAFETY: argc>=1 且 argv 由内核 exec 路径按 C 数组构造（NUL 结尾，
+    // loader argv 雏形 argc=1，init/src/main.rs 同款访问形态）。
+    let p = unsafe { *argv };
+    if p.is_null() {
+        return Some(0);
+    }
+    let mut n: usize = 0;
+    let mut i = 0isize;
+    let mut any = false;
+    unsafe {
+        while *p.offset(i) != 0 {
+            let c = *p.offset(i);
+            if c < b'0' || c > b'9' {
+                return None;
+            }
+            n = n.checked_mul(10)?.checked_add((c - b'0') as usize)?;
+            any = true;
+            i += 1;
+        }
+    }
+    if !any {
+        return None;
+    }
+    Some(n)
+}
+
 #[unsafe(no_mangle)]
-pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
-    login_main()
+pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
+    match parse_instance(argc, argv) {
+        Some(instance) => login_main(instance),
+        None => {
+            puts(b"login: FATAL: bad instance id in argv\n");
+            1
+        }
+    }
 }
