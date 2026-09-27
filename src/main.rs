@@ -358,16 +358,18 @@ fn read_trimmed(buf: &mut [u8], suppress_echo: bool) -> usize {
 fn login_main(instance: usize) -> i32 {
     // ---- 终端绑定 + 焦点认领（ADR-048 T5-c，owner 裁决 B：**认证前**）----
     // Unix getty 同构：getty/login 打开 tty 即独占键盘，认证只是决定该绑定
-    // 最终成为会话。实例 0 的绑定是**零变化**（fd 0 本就是 StdinNode 单例→
-    // 焦点环=环 0；dup2 后 fd 0 指向 /devices/console=同环，S13 同一真值）。
-    // 实例 1+：fd 0 重定向到实例环（**消费侧绑定**——shell 读自己的环，
-    // 绝不读焦点环偷别的会话键盘，S20）；focus_set 让生产侧（consoled[N]
+    // 最终成为会话。**E3（并行多会话）统一绑定**：所有实例（含 0）都把 fd 0
+    // dup2 到自己的实例环——原「instance 0 走 StdinNode 焦点环语义」的特判
+    // 在并行形态下是**双读者抢环**缺陷（实测 t7：焦点在实例 1 时，instance 0
+    // 的 login 经 StdinNode 也阻塞在环 1 的读上，抢走焦点会话的键盘字节、
+    // 以 3 次认证失败顶替退出）。统一「消费侧绑定自己的环」后，stdin 双径
+    // （焦点环 vs 实例环）收敛为单径（S13）；focus_set 让生产侧（consoled[N]
     // 的写过滤）放行字节进环 N。二者都要求 CAP_SYSTEM——此刻 login 仍是
     // init 给予的特权身份（合法窗口），认证失败即整体退出由 init 重生。
     //
     // 失败模式（S20）：绑定/认领任一失败 = 这个 getty 永远收不到键盘
     //（假活会话）——如实退出，init 重生。绝不静默继续。
-    if instance != 0 {
+    {
         // 消费侧绑定：fd 0 → 实例节点（shell 经 exec 继承此 fd 表）。
         // no_std format! 走 alloc——login 已链 alloc（shadow 解析用）。
         let path: alloc::string::String = alloc::format!("/devices/consoles/{}", instance);
