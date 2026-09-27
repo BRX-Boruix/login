@@ -172,6 +172,11 @@ const LINE_MAX: usize = 128;
 /// 登录后启动的 shell 路径。
 const SHELL_PATH: &str = "/programs/shell.elf";
 
+/// username 行提示符（S13 单点：打印与重绘共用同一字节串，S15）。
+const PROMPT_USERNAME: &[u8] = b"username: ";
+/// password 行提示符（suppress_echo 下只打印不重绘，常量仍供重绘协议用）。
+const PROMPT_PASSWORD: &[u8] = b"password: ";
+
 /// 打印一段字节（忽略错误——诊断输出失败不该改变认证结论）。
 fn puts(s: &[u8]) {
     let _ = write(STDOUT, s);
@@ -188,21 +193,30 @@ fn nl() {
 /// `EditorCaps` 裁到 `plain()`（历史/补全均不可达），故 `completions`
 /// **永远不会被调用**。这里如实返回空，不伪造候选。
 ///
-/// **重绘为何不打提示符**：`username: ` / `password: ` 由调用方在读之前打印一次。
-/// 若在重绘里重复打印，口令输入时会把提示符刷屏；且口令本就不该重绘。
-struct LoginHost;
+/// **为何持 prompt**：libline 的重绘协议是**整行所有权**——`redraw` 以
+/// `\r + \x1b[K` 擦掉整行后重打内容，行上已有的一切（含提示符）都会被擦。
+/// 提示符若只在进读取器前打印一次，首次重绘就会把它吃掉（实测缺陷：
+/// `username: r` 一键后变 `r`）。与 `shell` 的 `ShellHost::redraw` 同构：
+/// 每次重绘把提示符一起重打。口令路径（`suppress_echo`）不重绘，无刷屏。
+struct LoginHost {
+    /// 本行的提示符字节串（`"username: "` / `"password: "`），重绘时重打。
+    /// `&'static` 字面量：提示符是编译期常量，无所有权问题（S18）。
+    prompt: &'static [u8],
+}
 
 impl libline::EditorHost for LoginHost {
     fn write(&mut self, bytes: &[u8]) {
         puts(bytes);
     }
 
-    /// 回到行首 → 清行 → 重打缓冲区 → 光标左移回原位。
+    /// 回到行首 → 清行 → **重打提示符** → 重打缓冲区 → 光标左移回原位。
     ///
-    /// 字节序列与 `shell` 的重绘保持一致（`\r` + `\x1b[K` + 内容 + `\x1b[<n>D`），
-    /// 这样两个程序的终端行为相同，用户不会觉得登录界面与 shell 不一样。
+    /// 字节序列与 `shell` 的重绘保持一致（`\r` + `\x1b[K` + 提示符 + 内容 +
+    /// `\x1b[<n>D`），这样两个程序的终端行为相同，用户不会觉得登录界面
+    /// 与 shell 不一样。
     fn redraw(&mut self, buffer: &[u8], cursor: usize) {
         puts(b"\r\x1b[K");
+        puts(self.prompt);
         puts(buffer);
         let back = buffer.len().saturating_sub(cursor);
         if back > 0 {
@@ -305,10 +319,10 @@ fn dec_bytes(mut v: u64, buf: &mut [u8]) -> &[u8] {
 /// 返回：去掉首尾空白后的字节数。0 表示空行。
 /// **不 panic**——超过 `buf.len()` 即截断（缓冲区由 `Editor` 动态承载，
 /// 再按需拷入调用方的固定缓冲）。
-fn read_trimmed(buf: &mut [u8], suppress_echo: bool) -> usize {
+fn read_trimmed(buf: &mut [u8], suppress_echo: bool, prompt: &'static [u8]) -> usize {
     let mut editor = libline::Editor::new();
     let mut src = StdinSource::default();
-    let mut host = LoginHost;
+    let mut host = LoginHost { prompt };
 
     // `read_line` 只在 提交/中断/EOF 时返回，**不会**返回 `Continue`；
     // 故这里不需要外层循环。回车由下方 `nl()` 统一补一个换行。
@@ -426,8 +440,8 @@ fn login_main(instance: usize) -> i32 {
 
     let mut attempt = 0usize;
     while attempt < MAX_ATTEMPTS {
-        puts(b"username: ");
-        let nlen = read_trimmed(&mut name_buf, false);
+        puts(PROMPT_USERNAME);
+        let nlen = read_trimmed(&mut name_buf, false, PROMPT_USERNAME);
         if nlen == 0 {
             // 空用户名：计入一次尝试（避免空回车无限刷屏）。
             attempt += 1;
@@ -443,8 +457,8 @@ fn login_main(instance: usize) -> i32 {
             }
         };
 
-        puts(b"password: ");
-        let plen = read_trimmed(&mut pw_buf, true);
+        puts(PROMPT_PASSWORD);
+        let plen = read_trimmed(&mut pw_buf, true, PROMPT_PASSWORD);
 
         // 校验：用户不存在与口令错误**给出同一条消息**（避免用户名枚举，§1.5）。
         let ok = match shadow.iter().find(|e| e.name == name) {
