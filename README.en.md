@@ -1,33 +1,29 @@
 # login
 
-BORUIX's **login program**: it reads a username and password, verifies them, drops privileges to the target user, and switches to that user's shell.
+BORUIX's login program: it reads a username and password, verifies them, drops privileges to the target user, and switches to that user's shell.
 
 [简体中文](README.md)
 
-## What it does
-
-```
-read username and password → verify → drop privileges to the target user → switch to that user's shell
-```
-
 It is a standalone program, started by the system init process when it provides a terminal.
 
-## Handling failed verification
+## Usage
 
-| Rule | Details |
-| --- | --- |
-| At most **3 attempts** | Exits after three failures |
-| Failure messages are **uniform** | Not distinguishing "no such user" from "wrong password", so they cannot be used to probe which usernames exist |
-| Exits once exhausted | **Never lets anyone through on failure** |
+After boot a prompt appears on the terminal; enter the username and then the password. Nothing is displayed while typing the password.
+
+```
+login: alice
+password:
+```
+
+Once verified you enter that user's shell; three failures exit and you can log in again.
 
 ## Known limitations
 
-| Item | Status |
-| --- | --- |
-| Password echo | **Off** — no character is displayed while typing a password |
-| History and completion | **None** — login only; no line editing |
-| Failure lockout | **None** — after three failures it exits and can be retried |
-| Input timeout | **None** — no time limit |
+A wrong password and a nonexistent username return the same message. That is deliberate — otherwise the difference in error messages could be used to probe which usernames exist.
+
+Login offers no history and no Tab completion; those belong to the shell alone.
+
+After three failures it exits and can be retried. There is no failure lockout, and input has no time limit.
 
 ## Building
 
