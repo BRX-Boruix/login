@@ -386,7 +386,8 @@ fn login_main(instance: usize) -> i32 {
     {
         // 消费侧绑定：fd 0 → 实例节点（shell 经 exec 继承此 fd 表）。
         // no_std format! 走 alloc——login 已链 alloc（shadow 解析用）。
-        let path: alloc::string::String = alloc::format!("/devices/consoles/{}", instance);
+        let path: alloc::string::String =
+            alloc::format!("{}{}", libsys::CONSOLES_DIR_PREFIX, instance);
         let tty = match libsys::open(
             &path,
             libsys::OpenFlags::READ_ONLY,
